@@ -14,7 +14,7 @@ that preserve the information (key renames, restructuring, added fields) ship in
 clients. (Releases up to and including 4.0.0 treated any response-shape change as
 breaking; this narrower contract applies from the next release onward.)
 
-## [Unreleased]
+## [5.3.0] — 2026-09-27
 
 ### Added
 - Coaches can hide planned workouts from the athlete and lock them against edits: the web UI's "Hide from athlete" and "Athlete cannot edit" checkboxes. The `Event` model already parsed both flags, but no tool could set them and every tool dropped them from responses, so revealing a pre-built block week by week meant opening each workout in the web UI. `icu_create_event` and `icu_update_event` take optional `hide_from_athlete` and `athlete_cannot_edit`, sent only when passed, and `icu_bulk_create_events` documents both among its per-event fields. The new `icu_bulk_update_event_access` sets either flag on many events at once, selected by an ID list or a date range. It changes only WORKOUT events and reports notes, races and targets under `skipped`, events already in the requested state under `unchanged`, and per-event API errors under `failed` without aborting the rest. It deliberately does not use the API's date-range `PUT /events`, which has no category filter. Both flags appear in `icu_get_event` and the create/update responses, and in `icu_get_calendar_events` / `icu_get_upcoming_workouts` only when set, since the API returns `false` for both on every event. Live-verified that updating one flag leaves the other untouched. The flags are enforced by Intervals.icu, not by this server (#144, refs #142).
@@ -22,7 +22,7 @@ breaking; this narrower contract applies from the next release onward.)
 These additions take the server from 67 tools to 68 — `safe` (the default) from 64 to 65, `none` from 60 to 61.
 
 ### Fixed
-- `icu_update_sport_settings` was hard to find and its zone parameters read ambiguously, found in a live end-to-end test through Claude. Its description said "per-sport record" and never "sport settings", so a client's tool search for "sport settings" surfaced `icu_apply_sport_settings`, `icu_create_sport_settings` and `icu_delete_sport_settings` but not the update tool; the description now leads with "Update sport settings" and names HR/power zones. `max_hr` now says it is optional alongside `hr_zones` (Intervals.icu takes it from the last bound), and `power_zones_percent_ftp` states the ≤ 200 % limit that was previously only visible in the validation error (#137).
+- `icu_update_sport_settings` was hard to find and its zone parameters read ambiguously, found in a live end-to-end test through Claude. Its description said "per-sport record" and never "sport settings", so a client's tool search for "sport settings" surfaced `icu_apply_sport_settings`, `icu_create_sport_settings` and `icu_delete_sport_settings` but not the update tool; the description now leads with "Update sport settings" and names HR/power zones. `max_hr` now says it is optional alongside `hr_zones` (Intervals.icu takes it from the last bound), and `power_zones_percent_ftp` states the ≤ 200 % limit that was previously only visible in the validation error (#141, refs #137).
 - The README and `docs/tools.md` listed 7 MCP prompts; 9 are registered. `verify_setup` and `verify_multi_athlete` are now in the prompt table.
 
 ## [5.2.0] — 2026-09-23
