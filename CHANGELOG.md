@@ -14,6 +14,13 @@ that preserve the information (key renames, restructuring, added fields) ship in
 clients. (Releases up to and including 4.0.0 treated any response-shape change as
 breaking; this narrower contract applies from the next release onward.)
 
+## [5.5.0] — 2026-10-02
+
+### Added
+- `icu_delete_workout_folder` removes a library folder or training plan, so folders and plans created with `icu_create_workout_folder` no longer have to be cleaned up in the web UI. Deleting a folder also deletes every workout in it — that is how the API behaves. It registers in `safe` as well as `full`, but in `safe` mode a folder that still holds workouts is refused and reported under `skipped` with reason `folder_not_empty`, its workout count, and a hint about `INTERVALS_ICU_DELETE_MODE=full`; empty folders are deleted. `icu_delete_workout` already runs in `safe`, so full-only gating would have let a safe-mode user empty a folder but never remove it. The tool looks the folder up before deleting, because the API answers `200 {}` even for an ID that does not exist; an unknown ID returns a `validation_error` instead of a false success. Live-verified that calendar events applied from a deleted plan stay on the calendar. Contributed by @russellmays (#148, closes #147).
+
+This takes the server from 68 tools to 69 — `safe` (the default) from 65 to 66; `none` stays at 61.
+
 ## [5.4.0] — 2026-09-27
 
 ### Added
