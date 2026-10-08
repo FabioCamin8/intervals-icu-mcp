@@ -1,7 +1,6 @@
-"""Exercise the dependency-free probe over real TCP, including protocol failures."""
+"""Contract tests for the stdlib-only healthcheck entry point."""
 
 import http.client
-import json
 import os
 import socket
 import subprocess
@@ -10,503 +9,327 @@ import threading
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
 
 import pytest
-from mcp.types import Icon, Tool, ToolAnnotations, ToolExecution
-from pydantic import ValidationError
 
 from intervals_icu_mcp import healthcheck
-from intervals_icu_mcp.healthcheck import ProbeError, check
+
+
+def argv(*args: str) -> list[str]:
+    return ["/app/.venv/bin/python", "-m", "intervals_icu_mcp.server", *args]
+
+
+def test_read_server_argv_accepts_exact_entrypoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        healthcheck,
+        "_read_proc_cmdline",
+        lambda: b"/app/.venv/bin/python\0-m\0intervals_icu_mcp.server\0--port=8123\0",
+    )
+    assert healthcheck._read_server_argv() == [
+        "/app/.venv/bin/python",
+        "-m",
+        "intervals_icu_mcp.server",
+        "--port=8123",
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"", b"\0", b"python\0-m\0intervals_icu_mcp.server", b"python\0-m\0\xff\0"],
+)
+def test_read_server_argv_rejects_unreadable_or_malformed_data(
+    monkeypatch: pytest.MonkeyPatch, raw: bytes
+) -> None:
+    monkeypatch.setattr(healthcheck, "_read_proc_cmdline", lambda: raw)
+    with pytest.raises(ValueError):
+        healthcheck._read_server_argv()
+
+
+def test_read_server_argv_rejects_unreadable_proc(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unreadable() -> bytes:
+        raise PermissionError("private detail")
+
+    monkeypatch.setattr(healthcheck, "_read_proc_cmdline", unreadable)
+    with pytest.raises(ValueError):
+        healthcheck._read_server_argv()
+
+
+def test_target_from_argv_defaults_to_stdio() -> None:
+    assert healthcheck._target_from_argv(argv()) is None
+    assert healthcheck._target_from_argv(["python", "-m", "intervals_icu_mcp.server"]) is None
+    assert healthcheck._target_from_argv(["python3", "-m", "intervals_icu_mcp.server"]) is None
+
+
+def test_target_from_argv_last_split_and_equals_values_win() -> None:
+    assert healthcheck._target_from_argv(
+        argv("--transport", "http", "--host=127.0.0.2", "--port", "8001", "--port=8123", "--ho", "127.0.0.3")
+    ) == ("127.0.0.3", 8123)
+    assert healthcheck._target_from_argv(argv("--trans=streamable-http", "--po=8124")) == (
+        "127.0.0.1",
+        8124,
+    )
+    assert healthcheck._target_from_argv(
+        argv("--transport=http", "--verbose", "ignored", "--unrelated=value")
+    ) == ("127.0.0.1", 8000)
+
+
+@pytest.mark.parametrize("transport", ["http", "streamable-http", "sse"])
+def test_target_from_argv_http_transports(transport: str) -> None:
+    assert healthcheck._target_from_argv(argv("--transport", transport)) == (
+        "127.0.0.1",
+        8000,
+    )
+
+
+def test_target_from_argv_maps_ipv4_wildcard() -> None:
+    assert healthcheck._target_from_argv(argv("--transport=http", "--host", "0.0.0.0")) == (
+        "127.0.0.1",
+        8000,
+    )
+
+
+@pytest.mark.parametrize("ipv6_supported", [True, False])
+def test_target_from_argv_maps_ipv6_only_when_supported(
+    monkeypatch: pytest.MonkeyPatch, ipv6_supported: bool
+) -> None:
+    monkeypatch.setattr(socket, "has_ipv6", ipv6_supported)
+    if ipv6_supported:
+        assert healthcheck._target_from_argv(argv("--transport=http", "--host=::")) == (
+            "::1",
+            8000,
+        )
+    else:
+        with pytest.raises(ValueError):
+            healthcheck._target_from_argv(argv("--transport=http", "--host=::"))
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--transport",),
+        ("--transport=ftp",),
+        ("--host",),
+        ("--host=", "--transport=http"),
+        ("--port=wat",),
+        ("--port=0",),
+        ("--port=65536",),
+        ("--p=8000",),
+    ],
+)
+def test_target_from_argv_rejects_malformed_recognized_options(args: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError):
+        healthcheck._target_from_argv(argv("--transport=http", *args))
+
+
+@pytest.mark.parametrize(
+    "bad_argv",
+    [
+        ["tini", "--", "python", "-m", "intervals_icu_mcp.server"],
+        ["python", "-m", "other.module"],
+        ["python", "src/intervals_icu_mcp/server.py"],
+        ["/bin/sh", "-c", "python -m intervals_icu_mcp.server"],
+    ],
+)
+def test_unknown_pid1_fails_closed(bad_argv: list[str]) -> None:
+    with pytest.raises(ValueError):
+        healthcheck._target_from_argv(bad_argv)
 
 
 @contextmanager
-def endpoint(mode="json", tool_updates=None):
-    requests = []
+def endpoint(
+    *,
+    status: int = 200,
+    body: bytes = b'{"status":"ok"}',
+    headers: dict[str, str] | None = None,
+    delay: float = 0,
+):
+    seen: list[tuple[str, str]] = []
 
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_args):
+        def log_message(self, *_args: object) -> None:
             pass
 
-        def do_DELETE(self):
-            requests.append(("DELETE", dict(self.headers), None))
-            self.send_response(405 if mode == "no-delete" else 204)
-            self.end_headers()
-
-        def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            requests.append(("POST", dict(self.headers), body))
-            method = body["method"]
-            if method == "notifications/initialized":
-                self.send_response(500 if mode == "notification-fails" else 202)
-                self.end_headers()
-                return
-            if mode == "target-then-fails" and method == "tools/list" and "params" in body:
-                self.send_response(500)
-                self.end_headers()
-                return
-            if mode == "timeout":
-                time.sleep(0.3)
-            if mode == "redirect":
-                self.send_response(307)
-                self.send_header("Location", "/elsewhere")
-                self.end_headers()
-                return
-            result: dict[str, Any] = (
-                {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "test", "version": "1"},
-                }
-                if method == "initialize"
-                else {
-                    "tools": [
-                        {"name": "icu_get_athlete_profile", "inputSchema": {"type": "object"}}
-                    ]
-                }
-            )
-            if mode == "missing-tool" and method == "tools/list":
-                result = {"tools": []}
-            if mode in {"paginate", "cursor-loop", "bad-cursor"} and method == "tools/list":
-                if "params" not in body or mode != "paginate":
-                    result = {"tools": [], "nextCursor": 7 if mode == "bad-cursor" else "next"}
-            if mode in {"target-first-page", "target-then-fails"} and method == "tools/list":
-                if "params" not in body:
-                    result["nextCursor"] = "next"
-                else:
-                    result = {"tools": []}
-            if mode == "bad-init" and method == "initialize":
-                result["protocolVersion"] = "unknown"
-            if mode == "no-tools-capability" and method == "initialize":
-                result["capabilities"] = {}
-            if mode == "missing-schema" and method == "tools/list":
-                result = {"tools": [{"name": "icu_get_athlete_profile"}]}
-            if mode == "bad-tools" and method == "tools/list":
-                result = {"tools": [None]}
-            if method == "tools/list" and tool_updates is not None:
-                result["tools"][0].update(tool_updates)
-                if mode == "metadata-other-tool":
-                    result["tools"].append(
-                        {"name": "icu_get_athlete_profile", "inputSchema": {"type": "object"}}
-                    )
-            payload = {"jsonrpc": "2.0", "id": body["id"], "result": result}
-            if mode == "wrong-id":
-                payload["id"] = 999
-            if mode == "rpc-error":
-                payload = {"jsonrpc": "2.0", "id": body["id"], "error": {"code": -32603}}
-            content = json.dumps(payload).encode()
-            content_type = "application/json"
-            if mode in {"sse", "open-sse", "empty-sse", "multi-sse", "trickle", "wrong-event"}:
-                content_type = "text/event-stream"
-                content = b": keepalive\r\n\r\nevent: message\r\ndata: " + content + b"\r\n\r\n"
-                if mode == "wrong-event":
-                    content = content.replace(b"event: message", b"event: endpoint")
-                if mode == "multi-sse":
-                    notification = b'data: {"jsonrpc":"2.0","method":"notifications/test"}\n\n'
-                    content = notification + content.replace(b"data: {", b"data: {\ndata: ")
-                if mode == "empty-sse":
-                    content = b": keepalive\n\n"
-            if mode.startswith("newline-"):
-                ending = {"cr": b"\r", "lf": b"\n", "crlf": b"\r\n"}[mode.split("-")[1]]
-                content_type = "text/event-stream"
-                # Two data lines expose accidental extra event boundaries at split CRLF.
-                content = ending.join(
-                    [
-                        b": keepalive",
-                        b"",
-                        b"event: message",
-                        b"data: {",
-                        b"data: " + content[1:],
-                        b"",
-                        b"",
-                    ]
-                )
-            if mode == "mixed-case":
-                content_type = "Application/JSON; charset=utf-8"
-            if mode == "html":
-                content_type, content = "text/html", b"<html>ok</html>"
-            if mode == "malformed":
-                content = b"not json"
-            if mode == "oversized":
-                content = b" " * (1024 * 1024 + 1)
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            if mode != "stateless" and method == "initialize":
-                self.send_header("Mcp-Session-Id", "test-session")
-            if mode not in {"open-sse", "trickle"} and not mode.endswith("-open"):
-                self.send_header("Content-Length", str(len(content)))
+        def do_GET(self) -> None:
+            seen.append((self.command, self.path))
+            self.send_response(status)
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
+            if not any(name.lower() == "content-length" for name in (headers or {})):
+                self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             try:
-                if mode == "trickle":
-                    for _ in range(40):
-                        self.wfile.write(b":\n")
-                        self.wfile.flush()
-                        time.sleep(0.01)
-                else:
-                    self.wfile.write(content)
-                    self.wfile.flush()
-                    if mode == "open-sse" or mode.endswith("-open"):
-                        time.sleep(0.3)
+                if delay:
+                    time.sleep(delay)
+                self.wfile.write(body)
+                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}/mcp", requests
+        yield server.server_port, seen
     finally:
         server.shutdown()
         thread.join()
         server.server_close()
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "json",
-        "sse",
-        "multi-sse",
-        "open-sse",
-        "stateless",
-        "no-delete",
-        "paginate",
-        "mixed-case",
-        "target-first-page",
-    ],
-)
-def test_ready(mode):
-    with endpoint(mode) as (url, requests):
-        check(url, 1)
-    methods = [body["method"] for verb, _, body in requests if verb == "POST"]
-    assert methods == ["initialize", "notifications/initialized", "tools/list"] + (
-        ["tools/list"] if mode in {"paginate", "target-first-page"} else []
+def use_endpoint(monkeypatch: pytest.MonkeyPatch, port: int) -> None:
+    monkeypatch.setattr(
+        healthcheck,
+        "_read_server_argv",
+        lambda: argv("--transport=http", "--host=127.0.0.1", f"--port={port}"),
     )
-    assert requests[1][1]["MCP-Protocol-Version"] == "2025-06-18"
-    if mode == "stateless":
-        assert "Mcp-Session-Id" not in requests[1][1]
-        assert all(verb != "DELETE" for verb, _, _ in requests)
-    else:
-        assert requests[1][1]["Mcp-Session-Id"] == "test-session"
-        assert requests[-1][0] == "DELETE"
 
 
-@pytest.mark.parametrize("ending", ["cr", "lf", "crlf"])
-@pytest.mark.parametrize("read_size", [1, 7, 65536])
-def test_sse_line_endings_across_reads(ending, read_size, monkeypatch):
-    original = http.client.HTTPResponse.read1
+def test_health_request_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    accepted = b'{"status":"ok"}' + b" " * (4096 - len(b'{"status":"ok"}'))
+    with endpoint(body=accepted) as (port, seen):
+        use_endpoint(monkeypatch, port)
+        healthcheck.check()
+        assert seen == [("GET", "/health")]
 
-    def bounded_read(response, amount=-1):
-        return original(response, min(amount, read_size) if amount >= 0 else read_size)
-
-    monkeypatch.setattr(http.client.HTTPResponse, "read1", bounded_read)
-    with endpoint(f"newline-{ending}") as (url, requests):
-        check(url, 1)
-    assert requests[-1][0] == "DELETE"
-    assert [body["method"] for verb, _, body in requests if verb == "POST"] == [
-        "initialize",
-        "notifications/initialized",
-        "tools/list",
-    ]
-
-
-@pytest.mark.parametrize("ending", ["cr", "crlf"])
-def test_sse_terminal_separator_without_eof(ending):
-    with endpoint(f"newline-{ending}-open") as (url, _):
-        # Each server response stays open for 0.3 s, longer than the probe deadline.
-        check(url, 0.2)
+    with endpoint(body=b" " * 4097) as (port, _):
+        use_endpoint(monkeypatch, port)
+        with pytest.raises(healthcheck.ProbeError):
+            healthcheck.check(timeout=1)
 
 
 @pytest.mark.parametrize(
-    "mode",
+    ("status", "body"),
     [
-        "html",
-        "malformed",
-        "rpc-error",
-        "wrong-id",
-        "bad-init",
-        "missing-tool",
-        "notification-fails",
-        "no-tools-capability",
-        "bad-tools",
-        "missing-schema",
-        "wrong-event",
-        "target-then-fails",
-        "cursor-loop",
-        "bad-cursor",
-        "empty-sse",
-        "redirect",
-        "oversized",
+        (404, b'{"status":"ok"}'),
+        (503, b'{"status":"ok"}'),
+        (200, b"not json"),
+        (200, b'{"status":"not ok"}'),
+        (200, b'{"status":"ok","extra":true}'),
+        (200, b"[]"),
     ],
 )
-def test_protocol_failures(mode):
-    with endpoint(mode) as (url, requests):
-        with pytest.raises((ProbeError, ValueError)):
-            check(url, 1)
-    if mode == "redirect":
-        assert len(requests) == 1  # Never forwards a session to a redirect target.
-    elif mode not in {"html", "redirect"}:
-        assert requests[-1][0] == "DELETE"
+def test_health_request_requires_exact_status_json(
+    monkeypatch: pytest.MonkeyPatch, status: int, body: bytes
+) -> None:
+    with endpoint(status=status, body=body) as (port, _):
+        use_endpoint(monkeypatch, port)
+        with pytest.raises(healthcheck.ProbeError):
+            healthcheck.check(timeout=1)
 
 
-@pytest.mark.parametrize("mode", ["timeout", "trickle"])
-def test_bounded_timeout(mode):
-    with endpoint(mode) as (url, _):
-        start = time.monotonic()
-        with pytest.raises((ProbeError, OSError)):
-            check(url, 0.08)
-        assert time.monotonic() - start < 0.25
+def test_no_proxy_or_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("NO_PROXY", "")
+    with endpoint(status=302, headers={"Location": "http://127.0.0.1/elsewhere"}) as (
+        port,
+        seen,
+    ):
+        use_endpoint(monkeypatch, port)
+        with pytest.raises(healthcheck.ProbeError):
+            healthcheck.check(timeout=1)
+        assert seen == [("GET", "/health")]
 
 
-@pytest.mark.parametrize(
-    "url,timeout",
-    [
-        ("ftp://localhost/mcp", 1),
-        ("http://user:secret@localhost", 1),
-        ("http://localhost/#fragment", 1),
-        ("http://localhost", 0),
-        ("http://localhost", float("nan")),
-        ("http://localhost", float("inf")),
-    ],
-)
-def test_invalid_arguments(url, timeout):
-    with pytest.raises(ProbeError):
-        check(url, timeout)
+def test_health_request_times_out_and_redacts_response(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sentinel = "SENSITIVE_SENTINEL_91d4"
+    with endpoint(
+        body=sentinel.encode(), headers={"X-Sentinel": sentinel}, delay=0.2
+    ) as (port, _):
+        use_endpoint(monkeypatch, port)
+        monkeypatch.setattr(sys, "argv", ["healthcheck", "--timeout", "0.05"])
+        assert healthcheck.main() == 1
+        output = capsys.readouterr().out
+        assert output == "healthcheck failed\n"
+        assert sentinel not in output
+
+    with endpoint(
+        status=500, body=sentinel.encode(), headers={"X-Sentinel": sentinel}
+    ) as (port, _):
+        use_endpoint(monkeypatch, port)
+        assert healthcheck.main() == 1
+        output = capsys.readouterr().out
+        assert output == "healthcheck failed\n"
+        assert sentinel not in output
 
 
-def test_refused_and_cli_redaction():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        url = f"http://127.0.0.1:{sock.getsockname()[1]}/mcp"
-        with pytest.raises(OSError):
-            check(url, 1)
+def test_health_request_connection_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    listener.close()
+    use_endpoint(monkeypatch, port)
+    with pytest.raises(OSError):
+        healthcheck.check(timeout=0.5)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), -float("inf")])
+def test_check_rejects_invalid_timeout(timeout: float) -> None:
+    with pytest.raises(ValueError):
+        healthcheck.check(timeout=timeout)
+
+
+@pytest.mark.parametrize(("args", "expected"), [([], 2.0), (["--timeout", "10"], 10.0)])
+def test_main_timeout_default_and_override(
+    monkeypatch: pytest.MonkeyPatch, args: list[str], expected: float
+) -> None:
+    observed: list[float] = []
+    monkeypatch.setattr(healthcheck, "check", lambda timeout=2.0: observed.append(timeout))
+    monkeypatch.setattr(sys, "argv", ["healthcheck", *args])
+    assert healthcheck.main() == 0
+    assert observed == [expected]
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0", "-1", "bogus"])
+def test_main_invalid_timeout_is_generic(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    value: str,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["healthcheck", "--timeout", value])
+    assert healthcheck.main() == 1
+    assert capsys.readouterr().out == "healthcheck failed\n"
+
+
+def test_main_does_not_echo_unrecognized_argument_values(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sentinel = "CLI_SECRET_SENTINEL_621a"
+    monkeypatch.setattr(sys, "argv", ["healthcheck", "--url", sentinel])
+    assert healthcheck.main() == 1
+    output = capsys.readouterr().out
+    assert output == "healthcheck failed\n"
+    assert sentinel not in output
+
+
+def test_stdio_check_does_not_open_a_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(healthcheck, "_read_server_argv", lambda: argv())
+
+    def fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("stdio healthcheck attempted a network connection")
+
+    monkeypatch.setattr(http.client, "HTTPConnection", fail_if_called)
+    healthcheck.check()
+
+
+def test_stdio_package_import_does_not_load_server_or_sdk() -> None:
+    source = (
+        "import sys; import intervals_icu_mcp.healthcheck; "
+        "assert 'intervals_icu_mcp.server' not in sys.modules; "
+        "assert not any(name == 'mcp' or name.startswith('mcp.') for name in sys.modules); "
+        "assert 'fastmcp' not in sys.modules"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.path.join(os.path.dirname(__file__), "..", "src")
     result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "intervals_icu_mcp.healthcheck",
-            "--url",
-            "http://user:secret@localhost",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 1
-    assert result.stderr == "MCP readiness check failed\n"
-    assert "secret" not in result.stdout + result.stderr
-
-
-@pytest.fixture(scope="module")
-def real_server():
-    # The actual application, dummy credentials, loopback only. No tool invocation.
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    env = {k: v for k, v in os.environ.items() if not k.startswith("INTERVALS_ICU_")}
-    env.update(
-        INTERVALS_ICU_API_KEY="test-only",
-        INTERVALS_ICU_ATHLETE_ID="i0",
-        INTERVALS_ICU_DELETE_MODE="safe",
-    )
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "intervals_icu_mcp.server",
-            "--transport",
-            "http",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ],
+        [sys.executable, "-S", "-c", source],
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        for _ in range(100):
-            if process.poll() is not None:
-                pytest.fail("isolated server exited before readiness")
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.05):
-                    break
-            except OSError:
-                time.sleep(0.05)
-        else:
-            pytest.fail("isolated server did not start")
-        yield f"http://127.0.0.1:{port}/mcp"
-    finally:
-        process.terminate()
-        process.wait(timeout=5)
-
-
-def test_actual_intervals_server(real_server):
-    check(real_server, 2)
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "intervals_icu_mcp.healthcheck",
-            "--url",
-            real_server,
-            "--timeout",
-            "2",
-        ],
         capture_output=True,
         text=True,
-        timeout=4,
+        timeout=5,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "MCP ready\n"
-
-
-INVALID_METADATA = [
-    pytest.param({"title": []}, id="title"),
-    pytest.param({"description": []}, id="description"),
-    pytest.param({"outputSchema": []}, id="output-schema"),
-    pytest.param({"_meta": []}, id="meta"),
-    pytest.param({"annotations": []}, id="annotations"),
-    pytest.param({"annotations": {"title": []}}, id="annotation-title"),
-    *[
-        pytest.param({"annotations": {hint: []}}, id=hint)
-        for hint in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"]
-    ],
-    pytest.param({"icons": {}}, id="icons"),
-    pytest.param({"icons": [None]}, id="icon-object"),
-    pytest.param({"icons": [{}]}, id="icon-src-missing"),
-    pytest.param({"icons": [{"src": []}]}, id="icon-src"),
-    pytest.param(
-        {"icons": [{"src": "data:image/png;base64,AA==", "mimeType": []}]}, id="icon-mime"
-    ),
-    pytest.param(
-        {"icons": [{"src": "https://example.com/icon.png", "sizes": {}}]}, id="icon-sizes"
-    ),
-    pytest.param(
-        {"icons": [{"src": "https://example.com/icon.png", "sizes": [None]}]}, id="icon-size-item"
-    ),
-    pytest.param({"execution": []}, id="execution"),
-    pytest.param({"execution": {"taskSupport": "unknown"}}, id="task-support-enum"),
-    pytest.param({"execution": {"taskSupport": []}}, id="task-support-type"),
-]
-
-
-@pytest.mark.parametrize("mode", ["json", "sse"])
-@pytest.mark.parametrize("updates", INVALID_METADATA)
-def test_rejects_metadata_also_rejected_by_sdk(updates, mode):
-    tool = {"name": "icu_get_athlete_profile", "inputSchema": {"type": "object"}, **updates}
-    with pytest.raises(ValidationError):
-        Tool.model_validate(tool)
-    with endpoint(mode, updates) as (url, requests):
-        with pytest.raises(ProbeError, match="invalid MCP tool catalog"):
-            check(url, 1)
-    assert requests[-1][0] == "DELETE"
-
-
-VALID_METADATA = [
-    {},
-    {
-        "title": None,
-        "description": None,
-        "outputSchema": None,
-        "icons": None,
-        "annotations": None,
-        "_meta": None,
-        "execution": None,
-    },
-    {
-        "title": "Profile",
-        "description": "Read athlete profile",
-        "outputSchema": {"type": "object"},
-        "_meta": {"vendor": {"arbitrary": [1, False, None]}},
-    },
-    {
-        "annotations": {
-            "title": "Read",
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-        }
-    },
-    {
-        "annotations": {
-            "title": None,
-            "readOnlyHint": None,
-            "destructiveHint": None,
-            "idempotentHint": None,
-            "openWorldHint": None,
-        }
-    },
-    {
-        "icons": [
-            {
-                "src": "https://example.com/icon.png",
-                "mimeType": "image/png",
-                "sizes": ["16x16", "any"],
-            },
-            {"src": "data:image/png;base64,AA==", "mimeType": None, "sizes": None},
-        ]
-    },
-    *[
-        {"execution": {"taskSupport": support}}
-        for support in [None, "forbidden", "optional", "required"]
-    ],
-    {"icons": [], "annotations": {}, "execution": {}, "_meta": {}, "outputSchema": {}},
-    {
-        "vendorExtension": [],
-        "annotations": {"vendorExtension": []},
-        "icons": [{"src": "https://example.com/icon.png", "vendorExtension": []}],
-        "execution": {"vendorExtension": []},
-    },
-]
-
-
-@pytest.mark.parametrize("updates", VALID_METADATA)
-def test_accepts_valid_metadata_and_extensions(updates):
-    tool = {"name": "icu_get_athlete_profile", "inputSchema": {"type": "object"}, **updates}
-    Tool.model_validate(tool)
-    with endpoint("json", updates) as (url, _):
-        check(url, 1)
-
-
-def test_invalid_metadata_on_another_tool_still_fails():
-    with endpoint("metadata-other-tool", {"name": "icu_other", "description": []}) as (url, _):
-        with pytest.raises(ProbeError, match="invalid MCP tool catalog"):
-            check(url, 1)
-
-
-def test_known_metadata_fields_stay_in_sync_with_sdk():
-    # Dependency upgrades must flag new known fields/enum values for review;
-    # unknown vendor extensions remain allowed by the runtime checker.
-    assert set(Tool.model_json_schema()["properties"]) == {
-        "name",
-        "inputSchema",
-        *healthcheck._TOOL_OPTIONAL_TYPES,
-    }
-    assert set(ToolAnnotations.model_json_schema()["properties"]) == set(
-        healthcheck._ANNOTATION_TYPES
-    )
-    assert set(Icon.model_json_schema()["properties"]) == {"src", *healthcheck._ICON_OPTIONAL_TYPES}
-    schema = ToolExecution.model_json_schema()
-    assert set(schema["properties"]) == {"taskSupport"}
-    enum = next(
-        branch["enum"]
-        for branch in schema["properties"]["taskSupport"]["anyOf"]
-        if "enum" in branch
-    )
-    assert set(enum) == set(healthcheck._TASK_SUPPORT)
-
-
-@pytest.mark.parametrize(
-    "hint", ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"]
-)
-@pytest.mark.parametrize("value", [0, 1, "true", "false"])
-def test_requires_wire_boolean_without_sdk_coercion(hint, value):
-    # Pydantic accepts/coerces these; the MCP wire format requires actual booleans.
-    updates = {"annotations": {hint: value}}
-    tool = {"name": "icu_get_athlete_profile", "inputSchema": {}, **updates}
-    Tool.model_validate(tool)
-    with endpoint("json", updates) as (url, _):
-        with pytest.raises(ProbeError, match="invalid MCP tool catalog"):
-            check(url, 1)

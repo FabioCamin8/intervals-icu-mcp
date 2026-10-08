@@ -1,298 +1,190 @@
-"""Dependency-free readiness probe for the Streamable HTTP transport.
-
-Only initializes MCP and lists tools; never invokes an Intervals.icu tool.
-"""
+"""Small stdlib-only liveness check for stdio and HTTP server transports."""
 
 import argparse
 import http.client
 import json
 import math
-import sys
+import os
+import socket
 import time
-from typing import Any, cast
-from urllib.parse import urlsplit
+from collections.abc import Sequence
+from typing import NoReturn
 
-_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
-_MAX_BODY = 1024 * 1024
+_SERVER_MODULE = "intervals_icu_mcp.server"
+_MAX_BODY = 4096
+_TRANSPORTS = ("stdio", "http", "streamable-http", "sse")
 
 
 class ProbeError(Exception):
-    """The endpoint did not demonstrate MCP readiness."""
+    """The local server did not demonstrate liveness."""
 
 
-_TOOL_OPTIONAL_TYPES: dict[str, type[Any]] = {
-    "title": str,
-    "description": str,
-    "outputSchema": dict,
-    "icons": list,
-    "annotations": dict,
-    "_meta": dict,
-    "execution": dict,
-}
-_ANNOTATION_TYPES: dict[str, type[Any]] = {
-    "title": str,
-    "readOnlyHint": bool,
-    "destructiveHint": bool,
-    "idempotentHint": bool,
-    "openWorldHint": bool,
-}
-_ICON_OPTIONAL_TYPES: dict[str, type[Any]] = {"mimeType": str, "sizes": list}
-_TASK_SUPPORT = ("forbidden", "optional", "required")
+class _QuietArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        del message
+        raise ValueError("invalid arguments")
 
 
-def _optional_types(value: dict[str, Any], fields: dict[str, type[Any]]) -> bool:
-    return all(
-        value.get(name) is None or isinstance(value[name], expected)
-        for name, expected in fields.items()
-    )
+def _read_proc_cmdline() -> bytes:
+    with open("/proc/1/cmdline", "rb") as process:
+        return process.read()
 
 
-def _valid_tool(value: Any) -> bool:
-    """Validate known MCP Tool wire fields without SDK imports or coercion.
+def _is_python_executable(value: str) -> bool:
+    name = os.path.basename(value)
+    if name in {"python", "python3"}:
+        return True
+    if name.startswith("python3."):
+        return name[8:].isdigit()
+    return False
 
-    Unknown extension fields are allowed, as in the MCP SDK. Input/output
-    schemas and _meta are arbitrary objects, not schemas to evaluate here.
-    """
-    if not isinstance(value, dict):
-        return False
-    tool = cast(dict[str, Any], value)
+
+def _validate_entrypoint(argv: Sequence[str]) -> None:
     if (
-        not isinstance(tool.get("name"), str)
-        or not isinstance(tool.get("inputSchema"), dict)
-        or not _optional_types(tool, _TOOL_OPTIONAL_TYPES)
+        len(argv) < 3
+        or not _is_python_executable(argv[0])
+        or argv[1] != "-m"
+        or argv[2] != _SERVER_MODULE
     ):
-        return False
-    annotations = tool.get("annotations")
-    if annotations is not None and not _optional_types(annotations, _ANNOTATION_TYPES):
-        return False
-    icons = tool.get("icons")
-    if icons is not None:
-        for value in icons:
-            if not isinstance(value, dict):
-                return False
-            icon = cast(dict[str, Any], value)
-            if not isinstance(icon.get("src"), str) or not _optional_types(
-                icon, _ICON_OPTIONAL_TYPES
-            ):
-                return False
-            sizes = icon.get("sizes")
-            if sizes is not None and not all(isinstance(size, str) for size in sizes):
-                return False
-    execution = tool.get("execution")
-    return execution is None or execution.get("taskSupport") in (None, *_TASK_SUPPORT)
+        raise ValueError("unknown server process")
 
 
-class _Probe:
-    def __init__(self, url: str, timeout: float):
-        target = urlsplit(url)
-        if (
-            target.scheme not in {"http", "https"}
-            or not target.hostname
-            or target.username is not None
-            or target.password is not None
-            or target.fragment
-            or not math.isfinite(timeout)
-            or timeout <= 0
-        ):
-            raise ProbeError("invalid probe URL or timeout")
-        self.target = target
-        self.path = target.path or "/"
-        if target.query:
-            self.path += "?" + target.query
-        self.deadline = time.monotonic() + timeout
-        self.headers = {
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        }
-
-    def remaining(self) -> float:
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise ProbeError("probe deadline exceeded")
-        return remaining
-
-    @staticmethod
-    def result(payload: Any, request_id: int) -> dict[str, Any]:
-        if not isinstance(payload, dict):
-            raise ProbeError("invalid MCP response")
-        payload = cast(dict[str, Any], payload)
-        if (
-            payload.get("jsonrpc") != "2.0"
-            or type(payload.get("id")) is not int
-            or payload["id"] != request_id
-            or "error" in payload
-            or not isinstance(payload.get("result"), dict)
-        ):
-            raise ProbeError("invalid MCP response")
-        return payload["result"]
-
-    def request(self, method: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        connection_type = (
-            http.client.HTTPSConnection
-            if self.target.scheme == "https"
-            else http.client.HTTPConnection
-        )
-        connection = connection_type(
-            self.target.hostname or "", self.target.port, timeout=self.remaining()
-        )
-        try:
-            connection.connect()
-            sock = connection.sock
-            assert sock is not None
-            sock.settimeout(self.remaining())
-            data = json.dumps(body).encode() if body is not None else None
-            connection.request(method, self.path, data, self.headers)
-            sock.settimeout(self.remaining())
-            response = connection.getresponse()
-            with response:
-                if method == "DELETE":
-                    # Session termination is optional in Streamable HTTP.
-                    if response.status not in {200, 204, 405}:
-                        raise ProbeError("MCP session cleanup failed")
-                    return {}
-                if body is None:
-                    raise ProbeError("missing MCP request")
-                request_id = body.get("id")
-                if request_id is None:
-                    if response.status != 202:
-                        raise ProbeError("MCP initialization notification rejected")
-                    return {}
-                if response.status != 200:
-                    raise ProbeError("MCP request failed")
-                session = response.getheader("Mcp-Session-Id")
-                if body.get("method") == "initialize" and session:
-                    self.headers["Mcp-Session-Id"] = session
-                content_type = (
-                    response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
-                )
-                if content_type not in {"application/json", "text/event-stream"}:
-                    raise ProbeError("unsupported MCP response content type")
-                buffer = b""
-                size = 0
-                event_data: list[bytes] = []
-                event_type = b"message"
-                skip_lf = False
-                while True:
-                    self.remaining()
-                    if response.isclosed():
-                        chunk = b""
-                    else:
-                        sock.settimeout(self.remaining())
-                        chunk = response.read1(65536)
-                    size += len(chunk)
-                    if size > _MAX_BODY:
-                        raise ProbeError("MCP response too large")
-                    eof = not chunk
-                    if content_type == "text/event-stream":
-                        # CR ends a line immediately; swallow a following LF even
-                        # when CRLF is split across reads. Count raw bytes above.
-                        if skip_lf:
-                            chunk = chunk.removeprefix(b"\n")
-                        skip_lf = chunk.endswith(b"\r")
-                        chunk = chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-                    buffer += chunk
-                    if content_type == "application/json":
-                        if eof:
-                            return self.result(json.loads(buffer), request_id)
-                    else:
-                        while b"\n" in buffer:
-                            line, buffer = buffer.split(b"\n", 1)
-                            if line.startswith(b"event:"):
-                                event_type = line[6:].removeprefix(b" ")
-                            elif line.startswith(b"data:"):
-                                value = line[5:]
-                                event_data.append(value[1:] if value.startswith(b" ") else value)
-                            elif not line:
-                                if event_data and event_type == b"message":
-                                    payload = json.loads(b"\n".join(event_data))
-                                    if isinstance(payload, dict) and "id" in payload:
-                                        return self.result(payload, request_id)
-                                event_data = []
-                                event_type = b"message"
-                        if eof:
-                            raise ProbeError("MCP stream ended without a response")
-        finally:
-            connection.close()
-
-
-def check(url: str = "http://127.0.0.1:8000/mcp", timeout: float = 10.0) -> None:
-    """Require a valid MCP handshake and the athlete-profile tool in the catalog."""
-    probe = _Probe(url, timeout)
+def _read_server_argv() -> list[str]:
+    """Read and validate PID 1's exact Python module entrypoint."""
     try:
-        initialized = probe.request(
-            "POST",
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "intervals-icu-healthcheck", "version": "1"},
-                },
-            },
-        )
-        capabilities: Any = initialized.get("capabilities")
-        server: Any = initialized.get("serverInfo")
-        if (
-            not isinstance(initialized.get("protocolVersion"), str)
-            or initialized["protocolVersion"] not in _PROTOCOLS
-            or not isinstance(capabilities, dict)
-            or not isinstance(cast(dict[str, Any], capabilities).get("tools"), dict)
-            or not isinstance(server, dict)
-            or not isinstance(cast(dict[str, Any], server).get("name"), str)
-            or not isinstance(cast(dict[str, Any], server).get("version"), str)
-        ):
-            raise ProbeError("invalid MCP initialization result")
-        probe.headers["MCP-Protocol-Version"] = initialized["protocolVersion"]
-        probe.request("POST", {"jsonrpc": "2.0", "method": "notifications/initialized"})
-        cursor: str | None = None
-        seen: set[str] = set()
-        request_id = 2
-        target_seen = False
-        while True:
-            request: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": "tools/list"}
-            if cursor is not None:
-                request["params"] = {"cursor": cursor}
-            result = probe.request("POST", request)
-            tools = result.get("tools")
-            if not isinstance(tools, list) or any(not _valid_tool(tool) for tool in tools):
-                raise ProbeError("invalid MCP tool catalog")
-            target_seen |= any(tool["name"] == "icu_get_athlete_profile" for tool in tools)
-            next_cursor: Any = result.get("nextCursor")
-            if next_cursor is None:
-                if target_seen:
-                    return
-                raise ProbeError("expected MCP tool missing")
-            if not isinstance(next_cursor, str) or next_cursor in seen:
-                raise ProbeError("invalid MCP pagination cursor")
-            cursor = next_cursor
-            seen.add(cursor)
-            request_id += 1
+        raw = _read_proc_cmdline()
+        if not raw or not raw.endswith(b"\0"):
+            raise ValueError("malformed process command line")
+        argv = [part.decode("utf-8") for part in raw[:-1].split(b"\0")]
+        _validate_entrypoint(argv)
+        return argv
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("unknown server process") from exc
+
+
+def _server_argument_parser() -> _QuietArgumentParser:
+    parser = _QuietArgumentParser(add_help=False, allow_abbrev=True)
+    parser.add_argument("--transport", choices=_TRANSPORTS, default="stdio")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    # This option is recognized so abbreviations such as --p stay ambiguous
+    # in the same way as the server's parser. The health route is always root.
+    parser.add_argument("--path", default=None)
+    return parser
+
+
+def _target_from_argv(argv: list[str]) -> tuple[str, int] | None:
+    """Return the local HTTP target, or ``None`` for a known stdio server."""
+    _validate_entrypoint(argv)
+    parser = _server_argument_parser()
+    try:
+        options, _unknown = parser.parse_known_args(argv[3:])
+    except (argparse.ArgumentError, ValueError) as exc:
+        raise ValueError("invalid server options") from exc
+
+    if options.transport == "stdio":
+        return None
+    if not isinstance(options.host, str) or not options.host:
+        raise ValueError("invalid server host")
+    if not 1 <= options.port <= 65535:
+        raise ValueError("invalid server port")
+
+    host = options.host
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    elif host == "::":
+        if not socket.has_ipv6:
+            raise ValueError("IPv6 is unavailable")
+        host = "::1"
+    return host, options.port
+
+
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProbeError("healthcheck timed out")
+    return remaining
+
+
+def _valid_timeout(timeout: float) -> float:
+    if (
+        isinstance(timeout, bool)
+        or type(timeout) not in (int, float)
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("invalid timeout")
+    return float(timeout)
+
+
+def _read_health_response(
+    response: http.client.HTTPResponse, sock: socket.socket, deadline: float
+) -> bytes:
+    body = bytearray()
+    while len(body) <= _MAX_BODY:
+        if response.isclosed():
+            break
+        sock.settimeout(_remaining(deadline))
+        chunk = response.read1(_MAX_BODY + 1 - len(body))
+        if not chunk:
+            break
+        body.extend(chunk)
+        if len(body) > _MAX_BODY:
+            raise ProbeError("health response too large")
+    return bytes(body)
+
+
+def check(timeout: float = 2.0) -> None:
+    """Check local HTTP liveness, or return immediately for known stdio."""
+    duration = _valid_timeout(timeout)
+    target = _target_from_argv(_read_server_argv())
+    if target is None:
+        return
+
+    host, port = target
+    deadline = time.monotonic() + duration
+    connection = http.client.HTTPConnection(host, port, timeout=_remaining(deadline))
+    try:
+        connection.connect()
+        if connection.sock is None:
+            raise ProbeError("health connection unavailable")
+        sock = connection.sock
+        sock.settimeout(_remaining(deadline))
+        connection.request("GET", "/health")
+        sock.settimeout(_remaining(deadline))
+        response = connection.getresponse()
+        with response:
+            if response.status != 200:
+                raise ProbeError("health route returned an error")
+            body = _read_health_response(response, sock, deadline)
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ProbeError("health response was invalid") from exc
+        if payload != {"status": "ok"}:
+            raise ProbeError("health response was invalid")
     finally:
-        if "Mcp-Session-Id" in probe.headers:
-            try:
-                probe.request("DELETE")
-            except (ProbeError, OSError, ValueError, http.client.HTTPException):
-                # Cleanup cannot hide a failed probe or override readiness.
-                pass
+        connection.close()
+
+
+def _cli_parser() -> _QuietArgumentParser:
+    parser = _QuietArgumentParser(
+        prog="python -m intervals_icu_mcp.healthcheck",
+        description="Check the local Intervals.icu MCP server liveness.",
+    )
+    parser.add_argument("--timeout", type=float, default=2.0)
+    return parser
 
 
 def main() -> int:
-    """Exit zero on readiness, one on transport/protocol failure."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="http://127.0.0.1:8000/mcp")
-    parser.add_argument("--timeout", type=float, default=10.0, help="overall deadline in seconds")
-    args = parser.parse_args()
     try:
-        check(args.url, args.timeout)
-    except (ProbeError, OSError, ValueError, http.client.HTTPException):
-        # Do not print response bodies, URLs, session identifiers or credentials.
-        print("MCP readiness check failed", file=sys.stderr)
+        args = _cli_parser().parse_args()
+        check(timeout=args.timeout)
+    except Exception:
+        print("healthcheck failed")
         return 1
-    print("MCP ready")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
