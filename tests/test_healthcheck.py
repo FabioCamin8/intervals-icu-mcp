@@ -62,7 +62,16 @@ def test_target_from_argv_defaults_to_stdio() -> None:
 
 def test_target_from_argv_last_split_and_equals_values_win() -> None:
     assert healthcheck._target_from_argv(
-        argv("--transport", "http", "--host=127.0.0.2", "--port", "8001", "--port=8123", "--ho", "127.0.0.3")
+        argv(
+            "--transport",
+            "http",
+            "--host=127.0.0.2",
+            "--port",
+            "8001",
+            "--port=8123",
+            "--ho",
+            "127.0.0.3",
+        )
     ) == ("127.0.0.3", 8123)
     assert healthcheck._target_from_argv(argv("--trans=streamable-http", "--po=8124")) == (
         "127.0.0.1",
@@ -86,6 +95,161 @@ def test_target_from_argv_maps_ipv4_wildcard() -> None:
         "127.0.0.1",
         8000,
     )
+
+
+@pytest.mark.parametrize(
+    ("host", "port", "expected"),
+    [
+        ("127.0.0.2", None, ("127.0.0.2", 8000)),
+        (None, 8123, ("127.0.0.1", 8123)),
+        ("127.0.0.3", 8123, ("127.0.0.3", 8123)),
+        ("0.0.0.0", None, ("127.0.0.1", 8000)),
+        ("::", None, ("::1", 8000)),
+    ],
+)
+def test_explicit_target_uses_defaults_maps_wildcards_and_skips_proc(
+    host: str | None,
+    port: int | None,
+    expected: tuple[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    targets: list[tuple[str, int]] = []
+    monkeypatch.setattr(healthcheck.socket, "has_ipv6", True)
+
+    class FailedConnection:
+        sock = None
+
+        def __init__(self, host: str, port: int, *, timeout: float) -> None:
+            targets.append((host, port))
+
+        def connect(self) -> None:
+            raise ConnectionRefusedError
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        healthcheck,
+        "_read_server_argv",
+        lambda: (_ for _ in ()).throw(AssertionError("proc should be skipped")),
+    )
+    monkeypatch.setattr(healthcheck.http.client, "HTTPConnection", FailedConnection)
+    with pytest.raises(ConnectionRefusedError):
+        healthcheck.check(host=host, port=port)
+    assert targets == [expected]
+
+
+@pytest.mark.parametrize(
+    ("host", "port"),
+    [("", 8000), ("127.0.0.1", 0), ("127.0.0.1", 65536)],
+)
+def test_explicit_target_rejects_invalid_values(
+    host: str, port: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        healthcheck,
+        "_read_server_argv",
+        lambda: (_ for _ in ()).throw(AssertionError("proc should be skipped")),
+    )
+    with pytest.raises(ValueError):
+        healthcheck.check(host=host, port=port)
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--host", "127.0.0.2"], ("127.0.0.2", None)),
+        (["--port=8123"], (None, 8123)),
+        (["--host=127.0.0.3", "--port=8123"], ("127.0.0.3", 8123)),
+    ],
+)
+def test_main_passes_explicit_target_flags(
+    monkeypatch: pytest.MonkeyPatch, args: list[str], expected: tuple[str | None, int | None]
+) -> None:
+    observed: list[tuple[str | None, int | None]] = []
+
+    def check(*, timeout: float, host: str | None, port: int | None) -> None:
+        observed.append((host, port))
+
+    monkeypatch.setattr(healthcheck, "check", check)
+    monkeypatch.setattr(sys, "argv", ["healthcheck", *args])
+    assert healthcheck.main() == 0
+    assert observed == [expected]
+
+
+@pytest.mark.parametrize("args", [["--host="], ["--port=0"], ["--port=65536"], ["--port=wat"]])
+def test_main_rejects_invalid_explicit_target_flags(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], args: list[str]
+) -> None:
+    proc_reads: list[bool] = []
+
+    def read_proc() -> bytes:
+        proc_reads.append(True)
+        raise AssertionError("proc should be skipped")
+
+    monkeypatch.setattr(
+        healthcheck,
+        "_read_server_argv",
+        read_proc,
+    )
+    monkeypatch.setattr(sys, "argv", ["healthcheck", *args])
+    assert healthcheck.main() == 1
+    assert capsys.readouterr().out == "healthcheck failed\n"
+    assert proc_reads == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["--transport", "http"],
+        ["--trans=streamable-http", "--po=8124"],
+        ["--transport", "sse", "--path", "/mcp", "--host", "::", "--port", "8123"],
+        [
+            "--transport=http",
+            "--host=127.0.0.2",
+            "--port",
+            "8001",
+            "--port=8123",
+            "--ho",
+            "0.0.0.0",
+        ],
+    ],
+)
+def test_probe_parser_matches_server_cli_for_valid_arguments(args: list[str]) -> None:
+    from intervals_icu_mcp.server import _parse_args
+
+    server_args = _parse_args(args)
+    probe_args, _unknown = healthcheck._server_argument_parser().parse_known_args(args)
+    assert (probe_args.transport, probe_args.host, probe_args.port, probe_args.path) == (
+        server_args.transport,
+        server_args.host,
+        server_args.port,
+        server_args.path,
+    )
+    target = healthcheck._target_from_argv(argv(*args))
+    if server_args.transport == "stdio":
+        assert target is None
+    else:
+        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(server_args.host, server_args.host)
+        assert target == (host, server_args.port)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--transport=ftp"],
+        ["--port=not-a-number"],
+        ["--p=8000"],
+    ],
+)
+def test_probe_parser_rejects_server_cli_invalid_arguments(args: list[str]) -> None:
+    from intervals_icu_mcp.server import _parse_args
+
+    with pytest.raises(SystemExit):
+        _parse_args(args)
+    with pytest.raises(ValueError):
+        healthcheck._target_from_argv(argv(*args))
 
 
 @pytest.mark.parametrize("ipv6_supported", [True, False])
@@ -236,9 +400,7 @@ def test_health_request_times_out_and_redacts_response(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     sentinel = "SENSITIVE_SENTINEL_91d4"
-    with endpoint(
-        body=sentinel.encode(), headers={"X-Sentinel": sentinel}, delay=0.2
-    ) as (port, _):
+    with endpoint(body=sentinel.encode(), headers={"X-Sentinel": sentinel}, delay=0.2) as (port, _):
         use_endpoint(monkeypatch, port)
         monkeypatch.setattr(sys, "argv", ["healthcheck", "--timeout", "0.05"])
         assert healthcheck.main() == 1
@@ -246,9 +408,10 @@ def test_health_request_times_out_and_redacts_response(
         assert output == "healthcheck failed\n"
         assert sentinel not in output
 
-    with endpoint(
-        status=500, body=sentinel.encode(), headers={"X-Sentinel": sentinel}
-    ) as (port, _):
+    with endpoint(status=500, body=sentinel.encode(), headers={"X-Sentinel": sentinel}) as (
+        port,
+        _,
+    ):
         use_endpoint(monkeypatch, port)
         assert healthcheck.main() == 1
         output = capsys.readouterr().out
@@ -277,7 +440,11 @@ def test_main_timeout_default_and_override(
     monkeypatch: pytest.MonkeyPatch, args: list[str], expected: float
 ) -> None:
     observed: list[float] = []
-    monkeypatch.setattr(healthcheck, "check", lambda timeout=2.0: observed.append(timeout))
+    monkeypatch.setattr(
+        healthcheck,
+        "check",
+        lambda *, timeout=2.0, host=None, port=None: observed.append(timeout),
+    )
     monkeypatch.setattr(sys, "argv", ["healthcheck", *args])
     assert healthcheck.main() == 0
     assert observed == [expected]

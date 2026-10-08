@@ -32,32 +32,19 @@ intervals-icu-mcp --transport sse --host 127.0.0.1 --port 8000
 
 ## Container liveness check
 
-The image healthcheck runs `python -m intervals_icu_mcp.healthcheck` every
-30 seconds, with a 3-second hard timeout, a 5-second start period, and 3
-retries. The probe has a 2-second timeout by default and uses only Python's
-standard library. It reads Linux `/proc/1/cmdline` and recognizes the image's
-Python module entrypoint, `python -m intervals_icu_mcp.server` (including an
-absolute Python executable path). An init wrapper such as Docker `--init`, a
-different entrypoint, unreadable process information, or an unknown process
-layout fails the check; the probe does not guess.
+The image runs the stdlib probe every 30 seconds with a 5-second hard timeout,
+a 5-second start period, and 3 retries. Its own deadline defaults to 2 seconds.
+By default it reads Linux `/proc/1/cmdline` and recognizes the image's Python
+module entrypoint. A known stdio server gets an import-only check; HTTP,
+streamable HTTP, and SSE servers receive exactly `GET /health` at their
+configured target. The probe requires HTTP 200 and `{"status":"ok"}`. It does
+not verify MCP initialization, credentials, or upstream API availability.
 
-For a recognized stdio server, the probe performs an import-only check and
-makes no network connection. For `http`, `streamable-http`, and `sse`, it
-uses the server's configured host and port, mapping wildcard binds `0.0.0.0`
-and `::` to loopback addresses `127.0.0.1` and `::1`, then sends exactly
-`GET /health`. The root health route is independent of MCP's configured
-`--path`. The probe requires HTTP 200 and the exact JSON object
-`{"status":"ok"}`, with a maximum response size of 4096 bytes. It does not
-follow redirects or use HTTPS, proxies, or a configurable URL.
-
-This is a liveness check: it confirms that the process answers its static
-health route. It does not verify the MCP handshake or tool catalog, Intervals.icu
-credentials, or upstream API availability.
-
-The image default already checks HTTP transports. A Compose healthcheck
-override is optional; use one when production needs a different probe timeout,
-cadence, or startup period. Keep the existing server command and environment
-configuration:
+The default check fails closed for wrappers such as Docker `--init`, unknown
+entrypoints, or unreadable process information. For an HTTP server behind a
+wrapper, pass either or both target flags; this skips `/proc` and assumes HTTP.
+The omitted value defaults to host `127.0.0.1` or port `8000`. Wildcard hosts
+map to loopback. For example:
 
 ```yaml
 services:
@@ -66,19 +53,10 @@ services:
     command: ["--transport", "http", "--host", "0.0.0.0", "--port", "8000"]
     # Supply credentials using your existing environment/secret configuration.
     healthcheck:
-      test: ["CMD", "python", "-m", "intervals_icu_mcp.healthcheck", "--timeout", "10"]
-      interval: 30s
-      timeout: 12s
-      start_period: 30s
-      retries: 3
+      test: ["CMD", "python", "-m", "intervals_icu_mcp.healthcheck", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-The production settings keep a 30-second interval, a 12-second hard timeout,
-a 30-second start period, and 3 retries. The probe's `--timeout 10` bounds the
-individual connect/read work through a cooperative deadline and socket
-timeouts. Docker's 12-second hard timeout is the ultimate wall-time bound for
-the whole check, including DNS resolution and slow HTTP headers. Do not
-configure a separate probe endpoint or duplicate the MCP path in the
-healthcheck: it always requests the root `/health` route.
-For HTTP transports, the server CLI rejects MCP paths `/health` and `/health/`
-because they collide with that route.
+The health route stays at `/health` regardless of MCP's `--path`; the server
+rejects HTTP MCP paths `/health` and `/health/` because they collide with it.
+The probe deadline bounds connect/read work; Docker's hard timeout bounds the
+whole check, including process startup, DNS resolution, and slow HTTP framing.

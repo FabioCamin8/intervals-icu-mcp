@@ -21,6 +21,7 @@ async def health(request: Request) -> JSONResponse:
     """Return static HTTP liveness without accessing MCP or upstream APIs."""
     return JSONResponse({"status": "ok"})
 
+
 # Register middleware
 from .auth import load_config
 from .middleware import ConfigMiddleware

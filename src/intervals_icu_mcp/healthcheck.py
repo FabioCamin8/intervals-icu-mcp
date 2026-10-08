@@ -73,6 +73,23 @@ def _server_argument_parser() -> _QuietArgumentParser:
     return parser
 
 
+def _local_target(host: str | None, port: int | None) -> tuple[str, int]:
+    host = "127.0.0.1" if host is None else host
+    port = 8000 if port is None else port
+    if not host:
+        raise ValueError("invalid server host")
+    if isinstance(port, bool) or type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("invalid server port")
+
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    elif host == "::":
+        if not socket.has_ipv6:
+            raise ValueError("IPv6 is unavailable")
+        host = "::1"
+    return host, port
+
+
 def _target_from_argv(argv: list[str]) -> tuple[str, int] | None:
     """Return the local HTTP target, or ``None`` for a known stdio server."""
     _validate_entrypoint(argv)
@@ -84,19 +101,7 @@ def _target_from_argv(argv: list[str]) -> tuple[str, int] | None:
 
     if options.transport == "stdio":
         return None
-    if not isinstance(options.host, str) or not options.host:
-        raise ValueError("invalid server host")
-    if not 1 <= options.port <= 65535:
-        raise ValueError("invalid server port")
-
-    host = options.host
-    if host == "0.0.0.0":
-        host = "127.0.0.1"
-    elif host == "::":
-        if not socket.has_ipv6:
-            raise ValueError("IPv6 is unavailable")
-        host = "::1"
-    return host, options.port
+    return _local_target(options.host, options.port)
 
 
 def _remaining(deadline: float) -> float:
@@ -134,12 +139,15 @@ def _read_health_response(
     return bytes(body)
 
 
-def check(timeout: float = 2.0) -> None:
+def check(timeout: float = 2.0, host: str | None = None, port: int | None = None) -> None:
     """Check local HTTP liveness, or return immediately for known stdio."""
     duration = _valid_timeout(timeout)
-    target = _target_from_argv(_read_server_argv())
-    if target is None:
-        return
+    if host is None and port is None:
+        target = _target_from_argv(_read_server_argv())
+        if target is None:
+            return
+    else:
+        target = _local_target(host, port)
 
     host, port = target
     deadline = time.monotonic() + duration
@@ -173,13 +181,15 @@ def _cli_parser() -> _QuietArgumentParser:
         description="Check the local Intervals.icu MCP server liveness.",
     )
     parser.add_argument("--timeout", type=float, default=2.0)
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
     return parser
 
 
 def main() -> int:
     try:
         args = _cli_parser().parse_args()
-        check(timeout=args.timeout)
+        check(timeout=args.timeout, host=args.host, port=args.port)
     except Exception:
         print("healthcheck failed")
         return 1

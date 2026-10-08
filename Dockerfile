@@ -43,7 +43,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1
 
 # Health check uses the stdlib liveness probe; its default timeout is 2 seconds.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -m intervals_icu_mcp.healthcheck
 
 # Run the MCP server
