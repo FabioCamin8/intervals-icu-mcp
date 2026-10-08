@@ -12,6 +12,9 @@ from ..response_builder import ResponseBuilder
 from ..sport_settings_format import format_sport_settings_entry
 
 MAX_FITNESS_CHART_DAYS = 365
+# icu_list_athletes is called on every name lookup, so a coach's roster must not
+# carry every athlete's full notes. Enough to spot "injured" or "prefers mornings".
+NOTES_PREVIEW_CHARS = 150
 _FITNESS_CHART_FIELDS = ["id", "ctl", "atl", "rampRate", "ctlLoad", "atlLoad"]
 
 
@@ -89,7 +92,9 @@ async def list_athletes(
     Call this FIRST whenever a request concerns someone other than the default
     athlete, to resolve a name to the athlete_id that other tools take. Returns
     each athlete's access level, so you know before calling whether a write will
-    be permitted.
+    be permitted, plus any tags and a short preview of the athlete notes. Entries
+    with notes_truncated=true have longer notes; icu_get_athlete_profile returns
+    the full text.
     """
     assert ctx is not None
     config: ICUConfig = await ctx.get_state("config")
@@ -116,6 +121,13 @@ async def list_athletes(
                     entry["is_default"] = True
                 if record.get("icu_tags"):
                     entry["tags"] = record["icu_tags"]
+                notes = record.get("icu_notes")
+                if notes:
+                    if len(notes) > NOTES_PREVIEW_CHARS:
+                        entry["notes"] = notes[:NOTES_PREVIEW_CHARS].rstrip()
+                        entry["notes_truncated"] = True
+                    else:
+                        entry["notes"] = notes
                 athletes.append(entry)
 
             # Default athlete first, then alphabetical — a coach's own account is
@@ -176,8 +188,9 @@ async def get_athlete_profile(
 ) -> str:
     """Get an athlete's profile — sport settings (outdoor/indoor FTP, FTHR, pace) and current CTL/ATL/TSB.
 
-    Defaults to the authenticated athlete; coaches can pass athlete_id to read
-    one of their managed athletes instead.
+    Also returns the free-text athlete notes (Markdown) when set; change them
+    with icu_update_athlete_notes. Defaults to the authenticated athlete; coaches
+    can pass athlete_id to read one of their managed athletes instead.
     """
     assert ctx is not None
     config: ICUConfig = await ctx.get_state("config")
@@ -200,6 +213,8 @@ async def get_athlete_profile(
                 profile["dob"] = athlete.dob
             if athlete.weight:
                 profile["weight_kg"] = athlete.weight
+            if athlete.icu_notes:
+                profile["notes"] = athlete.icu_notes
 
             # Fitness metrics
             fitness: dict[str, Any] = {}
@@ -278,6 +293,57 @@ async def get_athlete_profile(
             e.message,
             error_type="api_error",
             suggestions=["Check your API key and athlete ID configuration"],
+        )
+    except Exception as e:
+        return ResponseBuilder.build_error_response(
+            f"Unexpected error: {str(e)}",
+            error_type="internal_error",
+        )
+
+
+async def update_athlete_notes(
+    notes: Annotated[
+        str,
+        "Full new notes text (Markdown). Replaces the existing notes; pass an empty string "
+        "to clear them.",
+    ],
+    athlete_id: Annotated[str | None, "Athlete ID (for coaches managing multiple athletes)"] = None,
+    ctx: Context | None = None,
+) -> str:
+    """REPLACE the free-text notes kept on an athlete's own record — not an activity comment or a calendar note.
+
+    Use for standing context about the athlete: "note on my profile that I'm
+    injured", "update my athlete notes". The whole text is overwritten, so to add
+    to existing notes read them first with icu_get_athlete_profile and send the
+    combined text. For a comment on one activity use icu_add_activity_message;
+    for a dated calendar note use icu_create_event.
+    """
+    assert ctx is not None
+    config: ICUConfig = await ctx.get_state("config")
+
+    try:
+        async with ICUClient(config) as client:
+            athlete = await client.update_athlete({"icu_notes": notes}, athlete_id=athlete_id)
+
+            # The API echoes the stored notes, but the spec does not promise it.
+            stored = athlete.icu_notes if athlete.icu_notes is not None else notes
+
+            return ResponseBuilder.build_response(
+                data={"athlete_id": athlete.id, "name": athlete.name, "notes": stored},
+                metadata={
+                    "message": "Athlete notes updated" if stored else "Athlete notes cleared"
+                },
+                query_type="update_athlete_notes",
+            )
+
+    except ICUAPIError as e:
+        return ResponseBuilder.build_error_response(
+            e.message,
+            error_type="api_error",
+            suggestions=[
+                "Check your API key and athlete ID configuration",
+                "Writing another athlete's notes needs coach access — see icu_list_athletes",
+            ],
         )
     except Exception as e:
         return ResponseBuilder.build_error_response(
