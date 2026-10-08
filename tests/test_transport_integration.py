@@ -6,6 +6,7 @@ actually serves MCP requests correctly over both the in-memory transport and
 the HTTP (streamable-http) transport exposed by `--transport http`.
 """
 
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -34,8 +35,11 @@ class TestInMemoryTransport:
         """Default delete_mode=safe registers 67 tools (3 destructive tools gated)."""
         async with Client(mcp) as client:
             tools = await client.list_tools()
-            assert len(tools) == 67
             names = {t.name for t in tools}
+            assert len(names) == 67
+            assert hashlib.sha256("\n".join(sorted(names)).encode()).hexdigest() == (
+                "509fd564cdc46973a36e8180471ff3311a922e25df7e337348aed88b5b7318d0"
+            )
             # Spot-check tools from different modules / tiers
             assert "icu_get_recent_activities" in names
             assert "icu_get_athlete_profile" in names
@@ -111,7 +115,9 @@ class TestHTTPTransport:
     """
 
     @asynccontextmanager
-    async def _http_client(self) -> AsyncIterator[httpx.AsyncClient]:
+    async def _http_client(
+        self, *, mcp_path: str = "/mcp"
+    ) -> AsyncIterator[httpx.AsyncClient]:
         """AsyncClient bound to the MCP ASGI app with lifespan managed.
 
         FastMCP's streamable-http transport initializes its session manager in
@@ -119,13 +125,40 @@ class TestHTTPTransport:
         events on its own, so we wrap the app in asgi_lifespan.LifespanManager
         to start / stop it around each test.
         """
-        app = mcp.http_app()
+        app = mcp.http_app(path=mcp_path)
         async with LifespanManager(app) as manager:
             transport = httpx.ASGITransport(app=manager.app)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://testserver"
             ) as client:
                 yield client
+
+    async def test_health_route_is_static_json_at_root(self):
+        async with self._http_client() as client:
+            response = await client.get("/health")
+
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("application/json")
+            assert response.json() == {"status": "ok"}
+            assert "mcp-session-id" not in response.headers
+
+            post_response = await client.post("/health", json={"unexpected": "body"})
+            assert post_response.status_code != 200
+
+    async def test_health_route_independent_of_custom_mcp_path(self):
+        async with self._http_client(mcp_path="/custom-mcp-path") as client:
+            response = await client.get("/health")
+            mcp_response = await client.post(
+                "/custom-mcp-path",
+                json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                headers={"Accept": "application/json"},
+            )
+
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("application/json")
+            assert response.json() == {"status": "ok"}
+            assert "mcp-session-id" not in response.headers
+            assert mcp_response.status_code != 404
 
     @staticmethod
     def _parse_sse_response(body: str) -> dict:
@@ -210,4 +243,7 @@ class TestHTTPTransport:
                 tools_payload = self._parse_sse_response(tools_body)
                 tool_names = {t["name"] for t in tools_payload["result"]["tools"]}
                 assert len(tool_names) == 67  # safe mode default
+                assert hashlib.sha256("\n".join(sorted(tool_names)).encode()).hexdigest() == (
+                    "509fd564cdc46973a36e8180471ff3311a922e25df7e337348aed88b5b7318d0"
+                )
                 assert "icu_get_recent_activities" in tool_names
