@@ -42,9 +42,9 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Health check (optional - checks if Python and dependencies are available)
+# Health check uses the stdlib liveness probe; its default timeout is 2 seconds.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import intervals_icu_mcp; print('ok')" || exit 1
+    CMD python -m intervals_icu_mcp.healthcheck
 
 # Run the MCP server
 ENTRYPOINT ["python", "-m", "intervals_icu_mcp.server"]

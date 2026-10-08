@@ -30,10 +30,34 @@ intervals-icu-mcp --transport sse --host 127.0.0.1 --port 8000
 >
 > Credentials are always read from `INTERVALS_ICU_API_KEY` and `INTERVALS_ICU_ATHLETE_ID` — use env vars (not a committed `.env`) when deploying to a shared host.
 
-## Lightweight readiness check for Streamable HTTP
+## Container liveness check
 
-For HTTP containers, override the image's import-only healthcheck with the
-optional dependency-free MCP probe:
+The image healthcheck runs `python -m intervals_icu_mcp.healthcheck` every
+30 seconds, with a 3-second hard timeout, a 5-second start period, and 3
+retries. The probe has a 2-second timeout by default and uses only Python's
+standard library. It reads Linux `/proc/1/cmdline` and recognizes the image's
+Python module entrypoint, `python -m intervals_icu_mcp.server` (including an
+absolute Python executable path). An init wrapper such as Docker `--init`, a
+different entrypoint, unreadable process information, or an unknown process
+layout fails the check; the probe does not guess.
+
+For a recognized stdio server, the probe performs an import-only check and
+makes no network connection. For `http`, `streamable-http`, and `sse`, it
+uses the server's configured host and port, mapping wildcard binds `0.0.0.0`
+and `::` to loopback addresses `127.0.0.1` and `::1`, then sends exactly
+`GET /health`. The root health route is independent of MCP's configured
+`--path`. The probe requires HTTP 200 and the exact JSON object
+`{"status":"ok"}`, with a maximum response size of 4096 bytes. It does not
+follow redirects or use HTTPS, proxies, or a configurable URL.
+
+This is a liveness check: it confirms that the process answers its static
+health route. It does not verify the MCP handshake or tool catalog, Intervals.icu
+credentials, or upstream API availability.
+
+The image default already checks HTTP transports. A Compose healthcheck
+override is optional; use one when production needs a different probe timeout,
+cadence, or startup period. Keep the existing server command and environment
+configuration:
 
 ```yaml
 services:
@@ -49,26 +73,12 @@ services:
       retries: 3
 ```
 
-The probe initializes MCP, sends the initialized notification, and reads the complete tool
-catalog, requiring `icu_get_athlete_profile`. It never calls a tool or the Intervals.icu
-API. Unlike launching a FastMCP client for every check, it imports only Python's
-standard library. JSON and SSE responses, optional sessions, and catalog
-pagination are supported. Sessions are terminated on a best-effort basis.
-
-Use `--url http://127.0.0.1:8000/custom-path` when overriding the MCP path or port.
-The default is `http://127.0.0.1:8000/mcp`. Use a direct container-local endpoint;
-the probe does not support authenticated proxies, URL credentials, redirects,
-or the legacy SSE transport. HTTPS uses the system certificate trust store.
-Failure exits nonzero without printing endpoint details or response content.
-
-The probe's deadline covers the handshake and catalog traversal. Keep Docker's
-hard timeout longer than `--timeout`; the hard timeout also bounds DNS resolution
-and slow HTTP headers. Each response is limited to 1 MiB. Readiness validates the JSON-RPC envelope, initialization fields, and known MCP
-Tool fields, including optional titles/descriptions, annotations, icons, output
-schemas, `_meta`, and execution properties. Optional fields may be omitted or
-null; unknown extension fields are allowed. Values must use the protocol's JSON
-types: strings/numbers are not coerced into booleans. Input/output schemas and
-`_meta` are checked as objects, as in the SDK; their contents are not evaluated
-as JSON Schema. Readiness does not demonstrate upstream API credential validity.
-Preserve your existing cadence, retry threshold, and recovery policy when
-replacing a probe. The default image healthcheck is unchanged for stdio users.
+The production settings keep a 30-second interval, a 12-second hard timeout,
+a 30-second start period, and 3 retries. The probe's `--timeout 10` bounds the
+individual connect/read work through a cooperative deadline and socket
+timeouts. Docker's 12-second hard timeout is the ultimate wall-time bound for
+the whole check, including DNS resolution and slow HTTP headers. Do not
+configure a separate probe endpoint or duplicate the MCP path in the
+healthcheck: it always requests the root `/health` route.
+For HTTP transports, the server CLI rejects MCP paths `/health` and `/health/`
+because they collide with that route.
