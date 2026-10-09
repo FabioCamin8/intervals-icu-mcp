@@ -40,9 +40,10 @@ streamable HTTP, and SSE servers receive exactly `GET /health` at their
 configured target. The probe requires HTTP 200 and `{"status":"ok"}`. It does
 not verify MCP initialization, credentials, or upstream API availability.
 
-The default check fails closed for wrappers such as Docker `--init`, unknown
-entrypoints, or unreadable process information. For an HTTP server behind a
-wrapper, pass either or both target flags; this skips `/proc` and assumes HTTP.
+For wrappers such as Docker `--init`, unknown entrypoints, or unreadable process
+information, the default check falls back to the previous import-only check.
+That fallback does not verify HTTP liveness. For an HTTP server behind a
+wrapper, pass either or both target flags; this skips `/proc` and checks HTTP.
 The omitted value defaults to host `127.0.0.1` or port `8000`. Wildcard hosts
 map to loopback. For example:
 

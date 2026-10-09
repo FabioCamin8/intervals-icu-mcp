@@ -140,10 +140,14 @@ def _read_health_response(
 
 
 def check(timeout: float = 2.0, host: str | None = None, port: int | None = None) -> None:
-    """Check local HTTP liveness, or return immediately for known stdio."""
+    """Check HTTP liveness, falling back to import-only for unknown PID 1."""
     duration = _valid_timeout(timeout)
     if host is None and port is None:
-        target = _target_from_argv(_read_server_argv())
+        try:
+            server_argv = _read_server_argv()
+        except ValueError:
+            return
+        target = _target_from_argv(server_argv)
         if target is None:
             return
     else:

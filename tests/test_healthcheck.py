@@ -294,9 +294,37 @@ def test_target_from_argv_rejects_malformed_recognized_options(args: tuple[str, 
         ["/bin/sh", "-c", "python -m intervals_icu_mcp.server"],
     ],
 )
-def test_unknown_pid1_fails_closed(bad_argv: list[str]) -> None:
+def test_unknown_pid1_is_not_an_http_target(bad_argv: list[str]) -> None:
     with pytest.raises(ValueError):
         healthcheck._target_from_argv(bad_argv)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"tini\0--\0python\0-m\0intervals_icu_mcp.server\0",
+        b"intervals-icu-mcp\0--transport=http\0",
+        b"/bin/sh\0-c\0python -m intervals_icu_mcp.server\0",
+        b"",
+        b"python\0-m\0\xff\0",
+        None,
+    ],
+)
+def test_unknown_pid1_falls_back_to_import_only(
+    monkeypatch: pytest.MonkeyPatch, raw: bytes | None
+) -> None:
+    def read_proc() -> bytes:
+        if raw is None:
+            raise PermissionError("unreadable proc")
+        return raw
+
+    def fail_if_connected(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("import-only fallback attempted a connection")
+
+    monkeypatch.setattr(healthcheck, "_read_proc_cmdline", read_proc)
+    monkeypatch.setattr(http.client, "HTTPConnection", fail_if_connected)
+    monkeypatch.setattr(sys, "argv", ["healthcheck"])
+    assert healthcheck.main() == 0
 
 
 @contextmanager
